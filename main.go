@@ -2,25 +2,26 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"time"
 
 	hazelcast "github.com/hazelcast/hazelcast-go-client"
 )
 
+var client *hazelcast.Client
+var myMap *hazelcast.Map
+
 func main() {
-	// Kubernetes Service and Port for the Hazelcast cluster
-	hazelcastService := os.Getenv("HAZELCAST_SERVICE") // Example: "hazelcast-service.namespace-example.svc.cluster.local:5701"
+	// Load configuration from environment variables
+	hazelcastService := os.Getenv("HAZELCAST_SERVICE") // Example: "hazelcast.project-100.svc.cluster.local:5701"
 	mapName := os.Getenv("HAZELCAST_MAP_NAME")         // Map name from environment variable
 
-	if hazelcastService == "" {
-		log.Fatal("HAZELCAST_SERVICE environment variable not set")
-	}
-
-	if mapName == "" {
-		log.Fatal("HAZELCAST_MAP_NAME environment variable not set")
+	if hazelcastService == "" || mapName == "" {
+		log.Fatal("Environment variables HAZELCAST_SERVICE and HAZELCAST_MAP_NAME must be set")
 	}
 
 	// Hazelcast configuration
@@ -28,25 +29,46 @@ func main() {
 	config.Cluster.Network.SetAddresses(hazelcastService)
 
 	// Connect to Hazelcast
-	client, err := hazelcast.StartNewClientWithConfig(context.Background(), config)
+	var err error
+	client, err = hazelcast.StartNewClientWithConfig(context.Background(), config)
 	if err != nil {
 		log.Fatalf("Failed to start Hazelcast client: %v", err)
 	}
 	defer client.Shutdown(context.Background())
 
 	// Get a map from Hazelcast
-	myMap, err := client.GetMap(context.Background(), mapName)
+	myMap, err = client.GetMap(context.Background(), mapName)
 	if err != nil {
 		log.Fatalf("Failed to get map: %v", err)
 	}
 
-	// Start data operations in parallel
+	// Start background data operations
 	done := make(chan struct{})
 	go writeDataInLoop(myMap, done)
 	go readDataInLoop(myMap, done)
 
-	// Wait indefinitely
-	select {}
+	// Start the HTTP server for health check
+	http.HandleFunc("/health", healthCheckHandler)
+	log.Println("Starting HTTP server for health checks on port 8080")
+	log.Fatal(http.ListenAndServe(":8080", nil))
+}
+
+// healthCheckHandler checks Hazelcast connectivity and returns a health status response.
+func healthCheckHandler(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	// Check Hazelcast connectivity by attempting a simple operation
+	_, err := myMap.Get(ctx, "example-key")
+	if err != nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(map[string]string{"status": "unhealthy", "error": err.Error()})
+		return
+	}
+
+	// If the operation succeeds, return healthy status
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{"status": "healthy"})
 }
 
 func writeDataInLoop(myMap *hazelcast.Map, done chan struct{}) {
@@ -55,7 +77,6 @@ func writeDataInLoop(myMap *hazelcast.Map, done chan struct{}) {
 		case <-done:
 			return
 		default:
-			// Write data
 			key := "example-key"
 			value := fmt.Sprintf("Hello, Hazelcast! Time: %s", time.Now().Format(time.RFC3339))
 			err := myMap.Set(context.Background(), key, value)
@@ -64,8 +85,6 @@ func writeDataInLoop(myMap *hazelcast.Map, done chan struct{}) {
 			} else {
 				log.Printf("Written data to Hazelcast: %s = %s", key, value)
 			}
-
-			// Wait a second before the next write
 			time.Sleep(1 * time.Second)
 		}
 	}
@@ -77,7 +96,6 @@ func readDataInLoop(myMap *hazelcast.Map, done chan struct{}) {
 		case <-done:
 			return
 		default:
-			// Read data
 			key := "example-key"
 			value, err := myMap.Get(context.Background(), key)
 			if err != nil {
@@ -85,8 +103,6 @@ func readDataInLoop(myMap *hazelcast.Map, done chan struct{}) {
 			} else {
 				log.Printf("Read data from Hazelcast: %s = %v", key, value)
 			}
-
-			// Wait a second before the next read
 			time.Sleep(1 * time.Second)
 		}
 	}
